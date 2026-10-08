@@ -1,0 +1,564 @@
+---
+title: "Informe de resultados — Prueba de Comprensión Cuantitativa"
+description: "Informe en R con tidyverse. El filtro usa crosstalk y queda dentro del HTML."
+lang: es
+format:
+  html:
+    theme: cosmo
+    css: informe.css
+    embed-resources: true
+    toc: false
+    page-layout: full
+    anchor-sections: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+library(tidyverse)
+library(htmltools)
+library(plotly)
+library(crosstalk)
+
+datos <- read_csv(
+  "datos.csv",
+  col_types = cols(
+    id = col_character(),
+    nombre = col_character(),
+    puntaje = col_double()
+  ),
+  show_col_types = FALSE
+) |>
+  arrange(id)
+
+grupo <- datos |>
+  summarise(
+    n = n(),
+    media = mean(puntaje),
+    desv = sd(puntaje),
+    mediana = median(puntaje),
+    minimo = min(puntaje),
+    maximo = max(puntaje)
+  )
+
+fmt <- function(x, d = 1) {
+  format(round(x, d), nsmall = d, decimal.mark = ",", big.mark = "")
+}
+
+fmt_signo <- function(x, d = 1) {
+  valor <- fmt(abs(x), d)
+  ifelse(x >= 0.005, paste0("+", valor), ifelse(x <= -0.005, paste0("−", valor), fmt(0, d)))
+}
+
+apilar <- function(puntaje, umbral = 1.6) {
+  orden <- order(puntaje, seq_along(puntaje))
+  nivel <- integer(length(puntaje))
+  ultimo <- -Inf
+  pila <- 0L
+  for (i in orden) {
+    if ((puntaje[[i]] - ultimo) < umbral) pila <- pila + 1L else pila <- 0L
+    nivel[[i]] <- pila
+    ultimo <- puntaje[[i]]
+  }
+  nivel
+}
+
+personas <- datos |>
+  mutate(
+    z = (puntaje - grupo$media) / grupo$desv,
+    percentil = map_int(puntaje, function(p) round(100 * mean(datos$puntaje < p))),
+    puesto = map_int(puntaje, function(p) 1L + sum(datos$puntaje > p)),
+    delta = puntaje - grupo$media,
+    percentil_curva = map_int(puntaje, function(p) round(100 * pnorm(p, grupo$media, grupo$desv))),
+    etiqueta = paste(id, nombre, sep = " · "),
+    frase_lectura = case_when(
+      percentil_curva >= 85 ~ "Queda en el extremo alto de la curva, por encima de casi todo el grupo de referencia.",
+      percentil_curva >= 65 ~ "Queda en la parte alta de la curva, por encima de la mayor parte del grupo de referencia.",
+      percentil_curva >= 35 ~ "Queda en la zona central de la curva, cerca del resultado típico del grupo.",
+      percentil_curva >= 15 ~ "Queda por debajo del centro de la curva.",
+      TRUE ~ "Queda en el extremo bajo de la curva, por debajo de la mayor parte del grupo de referencia."
+    ),
+    frente = case_when(
+      abs(delta) < 0.05 ~ paste0("Coincide con la media del grupo (", fmt(grupo$media), ")."),
+      delta > 0 ~ paste0("Está ", fmt(abs(delta)), " puntos por encima de la media (", fmt(grupo$media), ")."),
+      TRUE ~ paste0("Está ", fmt(abs(delta)), " puntos por debajo de la media (", fmt(grupo$media), ").")
+    ),
+    comparado = case_when(
+      puesto == 1 ~ paste0("Es el puntaje más alto de la muestra: supera al ", percentil, "% del grupo."),
+      percentil == 0 ~ "Es el puntaje más bajo de la muestra.",
+      TRUE ~ paste0("Supera al ", percentil, "% del grupo.")
+    ),
+    texto = paste0(
+      comparado,
+      " En la curva normal de esta muestra, el puntaje cae en el percentil ",
+      percentil_curva, " (z = ", fmt_signo(z), "). ",
+      frase_lectura, " ", frente
+    )
+  )
+
+ancho <- 5
+cortes <- seq(
+  floor(min(datos$puntaje) / ancho) * ancho,
+  ceiling((max(datos$puntaje) + 0.001) / ancho) * ancho,
+  by = ancho
+)
+
+bins <- datos |>
+  mutate(inicio = cortes[cut(puntaje, cortes, right = FALSE, labels = FALSE)]) |>
+  count(inicio, name = "personas") |>
+  complete(inicio = cortes[-length(cortes)], fill = list(personas = 0)) |>
+  mutate(centro = inicio + ancho / 2)
+
+techo <- max(bins$personas) + 1.8
+
+curva <- tibble(
+  x = seq(grupo$media - 3.3 * grupo$desv, grupo$media + 3.3 * grupo$desv, length.out = 160)
+) |>
+  mutate(densidad = dnorm(x, grupo$media, grupo$desv))
+
+y_max <- max(curva$densidad)
+
+puntos <- datos |>
+  arrange(puntaje, id) |>
+  mutate(nivel = apilar(puntaje), y_rug = -0.008 - nivel * 0.0045)
+
+# Cada marca lleva la curva y las barras completas. Crosstalk, al elegir
+# una persona, conserva solo sus filas: la distribución sigue visible y
+# cambia el sombreado.
+con_id <- function(tabla) tidyr::crossing(id = datos$id, tabla)
+
+shared <- SharedData$new(personas, key = ~id, group = "prueba")
+
+shared_bins <- SharedData$new(con_id(bins), key = ~id, group = "prueba")
+shared_conteos <- SharedData$new(
+  con_id(bins |> filter(personas > 0)),
+  key = ~id,
+  group = "prueba"
+)
+shared_resalte <- SharedData$new(
+  personas |>
+    mutate(inicio = cortes[cut(puntaje, cortes, right = FALSE, labels = FALSE)]) |>
+    left_join(bins |> select(inicio, personas), by = "inicio") |>
+    mutate(centro = inicio + ancho / 2),
+  key = ~id,
+  group = "prueba"
+)
+shared_media_hist <- SharedData$new(
+  personas |> transmute(
+    id,
+    x = grupo$media, xend = grupo$media,
+    y = 0, yend = 4.05,
+    x_texto = grupo$media - 8, y_texto = techo - 0.55,
+    texto = paste0("Media ", fmt(grupo$media))
+  ),
+  key = ~id,
+  group = "prueba"
+)
+shared_marca_hist <- SharedData$new(
+  personas |> transmute(id, nombre, puntaje, y = techo - 0.45),
+  key = ~id,
+  group = "prueba"
+)
+
+shared_curva <- SharedData$new(con_id(curva), key = ~id, group = "prueba")
+shared_sombra <- SharedData$new(
+  personas |>
+    group_by(id) |>
+    reframe({
+      corte <- puntaje[[1]]
+      dentro <- curva |> filter(x <= corte)
+      tibble(
+        x = c(dentro$x[1], dentro$x, corte),
+        densidad = c(0, dentro$densidad, 0)
+      )
+    }),
+  key = ~id,
+  group = "prueba"
+)
+shared_rug <- SharedData$new(
+  con_id(puntos |> transmute(id_punto = id, nombre, puntaje, y_rug)),
+  key = ~id,
+  group = "prueba"
+)
+shared_eje <- SharedData$new(
+  personas |> transmute(
+    id,
+    x = grupo$media,
+    xend = grupo$media,
+    y = 0,
+    yend = y_max,
+    texto = paste0("Media ", fmt(grupo$media)),
+    pos = if_else(puntaje >= grupo$media, "top left", "top right")
+  ),
+  key = ~id,
+  group = "prueba"
+)
+shared_persona_curva <- SharedData$new(
+  personas |> transmute(
+    id,
+    puntaje,
+    y = dnorm(puntaje, grupo$media, grupo$desv),
+    texto = paste0(id, " · ", as.integer(puntaje)),
+    x_texto = if_else(puntaje >= grupo$media, puntaje + 3.4, puntaje - 3.4),
+    y_texto = dnorm(puntaje, grupo$media, grupo$desv) + y_max * 0.11,
+    pos = if_else(puntaje >= grupo$media, "middle left", "middle right")
+  ),
+  key = ~id,
+  group = "prueba"
+)
+
+tema_ejes <- function(p, titulo_x = "Puntaje", titulo_y = NULL, rango_y = NULL, eje_x = list(), mostrar_y = TRUE) {
+  p |>
+    layout(
+      paper_bgcolor = "#fffcf8",
+      plot_bgcolor = "#fffcf8",
+      showlegend = FALSE,
+      font = list(family = "Avenir Next, Segoe UI, sans-serif", color = "#6f675e", size = 12),
+      margin = list(l = 52, r = 18, t = 28, b = 52),
+      xaxis = modifyList(
+        list(title = titulo_x, gridcolor = "#f3eee6", zeroline = FALSE, fixedrange = TRUE),
+        eje_x
+      ),
+      yaxis = list(
+        title = if (mostrar_y) titulo_y else "",
+        showticklabels = mostrar_y,
+        gridcolor = if (mostrar_y) "#f3eee6" else "transparent",
+        zeroline = FALSE,
+        fixedrange = TRUE,
+        range = rango_y
+      )
+    ) |>
+    config(displayModeBar = FALSE)
+}
+
+grafico_histograma <- plot_ly(height = 340) |>
+  add_bars(
+    data = shared_bins,
+    x = ~centro, y = ~personas,
+    width = 4.5,
+    color = I("#d5e0e8"),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_bars(
+    data = shared_resalte,
+    x = ~centro, y = ~personas,
+    width = 4.5,
+    color = I("#1f4b5a"),
+    hovertemplate = paste0("%{customdata}<extra></extra>"),
+    customdata = ~paste0(nombre, ": ", as.integer(puntaje), " puntos"),
+    showlegend = FALSE
+  ) |>
+  add_text(
+    data = shared_conteos,
+    x = ~centro, y = ~personas,
+    text = ~personas,
+    textposition = "top center",
+    textfont = list(color = "#1f4b5a", size = 13),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_segments(
+    data = shared_media_hist,
+    x = ~x, xend = ~xend, y = ~y, yend = ~yend,
+    color = I("#0f6e6b"),
+    line = list(dash = "dash", width = 2),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_text(
+    data = shared_media_hist,
+    x = ~x_texto, y = ~y_texto,
+    text = ~texto,
+    textposition = "middle center",
+    textfont = list(color = "#0f6e6b", size = 13),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_segments(
+    data = shared_marca_hist,
+    x = ~puntaje, xend = ~puntaje, y = 0, yend = ~y,
+    color = I("#c4552a"),
+    line = list(width = 2),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_markers(
+    data = shared_marca_hist,
+    x = ~puntaje, y = ~y,
+    marker = list(color = "#c4552a", size = 9),
+    hovertemplate = paste0("%{customdata}<extra></extra>"),
+    customdata = ~paste0(nombre, ": ", as.integer(puntaje), " puntos"),
+    showlegend = FALSE
+  ) |>
+  tema_ejes("Puntaje", "Personas", c(0, techo), list(
+    tickmode = "array",
+    tickvals = bins$centro,
+    ticktext = bins$inicio
+  ))
+
+grafico_curva <- plot_ly(height = 440) |>
+  add_lines(
+    data = shared_curva,
+    x = ~x, y = ~densidad,
+    color = I("#1c2430"),
+    line = list(width = 2.4),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_polygons(
+    data = shared_sombra,
+    x = ~x, y = ~densidad,
+    fillcolor = "rgba(244, 215, 200, 0.95)",
+    line = list(width = 0, color = "transparent"),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_segments(
+    data = shared_eje,
+    x = ~x, xend = ~xend, y = ~y, yend = ~yend,
+    color = I("#0f6e6b"),
+    line = list(dash = "dash", width = 2),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_text(
+    data = shared_eje,
+    x = ~x, y = ~(yend * 1.08),
+    text = ~texto,
+    textposition = ~pos,
+    textfont = list(color = "#0f6e6b", size = 13),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_markers(
+    data = shared_rug,
+    x = ~puntaje, y = ~y_rug,
+    marker = list(color = "#1f4b5a", size = 8),
+    hovertemplate = paste0("%{customdata}<extra></extra>"),
+    customdata = ~paste0(nombre, " (", id_punto, "): ", as.integer(puntaje), " puntos"),
+    showlegend = FALSE
+  ) |>
+  add_segments(
+    data = shared_persona_curva,
+    x = ~puntaje, xend = ~puntaje, y = 0, yend = ~y,
+    color = I("#c4552a"),
+    line = list(width = 2),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  add_markers(
+    data = shared_persona_curva,
+    x = ~puntaje, y = ~y,
+    marker = list(color = "#c4552a", size = 11, line = list(color = "#fffdf9", width = 1)),
+    hovertemplate = paste0("%{customdata}<extra></extra>"),
+    customdata = ~paste0(id, ": ", as.integer(puntaje), " puntos"),
+    showlegend = FALSE
+  ) |>
+  add_text(
+    data = shared_persona_curva,
+    x = ~x_texto, y = ~y_texto,
+    text = ~texto,
+    textposition = ~pos,
+    textfont = list(color = "#c4552a", size = 13),
+    hoverinfo = "skip",
+    showlegend = FALSE
+  ) |>
+  tema_ejes("Puntaje", NULL, c(min(puntos$y_rug) - 0.006, y_max * 1.28), mostrar_y = FALSE)
+
+kpi <- function(etiqueta, valor) {
+  div(class = "kpi", p(class = "kpi-k", etiqueta), p(class = "kpi-v", valor))
+}
+
+filtro <- filter_select(
+  "persona",
+  "Identificador de la persona",
+  shared,
+  ~etiqueta,
+  multiple = FALSE
+)
+```
+
+::: {.informe}
+
+<p class="kicker">Informe de resultados</p>
+
+# Prueba de Comprensión Cuantitativa
+
+<p class="bajada">Aplicación del 8 de octubre de 2026 · Escala de 0 a 100</p>
+
+<dl class="metas">
+  <div><dt>Código</dt><dd>CC-2026-10</dd></div>
+  <div><dt>Grupo</dt><dd>20 personas</dd></div>
+  <div><dt>Lectura</dt><dd>Grupo y consulta individual</dd></div>
+</dl>
+
+<p class="intro">La prueba recoge la capacidad de interpretar información numérica y resolver problemas cuantitativos. Este informe resume la media y la distribución del grupo. Más abajo se puede elegir el identificador de una persona para ver en qué lugar de la curva queda su puntaje.</p>
+
+## Resultados del grupo
+
+```{r}
+p(
+  class = "prosa",
+  paste0(
+    "La media de la prueba es ", fmt(grupo$media),
+    " puntos y la desviación estándar es ", fmt(grupo$desv),
+    ". La mediana es ", fmt(grupo$mediana),
+    " y los puntajes observados van de ", grupo$minimo,
+    " a ", grupo$maximo, "."
+  )
+)
+```
+
+```{r}
+div(
+  class = "kpis",
+  kpi("Personas", grupo$n),
+  kpi("Media", fmt(grupo$media)),
+  kpi("Desviación estándar", fmt(grupo$desv)),
+  kpi("Mediana", fmt(grupo$mediana)),
+  kpi("Mínimo", grupo$minimo),
+  kpi("Máximo", grupo$maximo)
+)
+```
+
+::: {.figura}
+
+```{r}
+grafico_histograma
+```
+
+<ul class="leyenda">
+  <li><span class="swatch barra"></span>Personas en ese tramo</li>
+  <li><span class="swatch media"></span>Media del grupo</li>
+  <li><span class="swatch persona"></span>Persona seleccionada</li>
+</ul>
+
+<figcaption>Figura 1. Distribución de los puntajes, en tramos de 5 puntos. La barra oscura y la marca naranja corresponden a la persona elegida.</figcaption>
+
+:::
+
+## Consulta por persona
+
+<p>Elige un identificador. El informe marca ese puntaje sobre la curva normal del grupo y dice a cuántas personas supera. El puntaje <em>z</em> mide la distancia a la media en desviaciones estándar: cero es la media y un valor positivo queda a la derecha de la curva.</p>
+
+```{r}
+filtro
+```
+
+```{r}
+tagList(pmap(personas, function(id, nombre, puntaje, puesto, percentil, percentil_curva, z, texto, ...) {
+  div(
+    class = "ficha",
+    `data-persona` = id,
+    hidden = if (id != "P12") NA else NULL,
+    div(
+      class = "ficha-top",
+      div(
+        p(class = "ficha-id", id),
+        h3(nombre)
+      ),
+      p(class = "puesto", paste("Puesto", puesto, "de", grupo$n))
+    ),
+    tags$dl(
+      class = "medidas",
+      div(tags$dt("Puntaje"), tags$dd(as.integer(puntaje))),
+      div(tags$dt("Percentil del grupo"), tags$dd(percentil)),
+      div(tags$dt("Percentil en la curva"), tags$dd(percentil_curva)),
+      div(tags$dt("Puntaje z"), tags$dd(fmt_signo(z)))
+    ),
+    p(class = "lectura", texto)
+  )
+}))
+```
+
+::: {.figura}
+
+```{r}
+grafico_curva
+```
+
+<ul class="leyenda">
+  <li><span class="swatch sombra"></span>Por debajo del puntaje elegido</li>
+  <li><span class="swatch media"></span>Media del grupo</li>
+  <li><span class="swatch persona"></span>Puntaje de la persona</li>
+</ul>
+
+<figcaption>Figura 2. Curva normal con la media y la desviación de esta muestra. El área sombreada queda por debajo del puntaje elegido. Cada punto bajo el eje es una persona.</figcaption>
+
+:::
+
+## Puntajes de la muestra
+
+```{r}
+div(
+  class = "tabla-wrap",
+  tags$table(
+    class = "tabla",
+    tags$thead(
+      tags$tr(
+        tags$th("ID"),
+        tags$th("Nombre"),
+        tags$th(class = "num", "Puntaje"),
+        tags$th(class = "num", "z"),
+        tags$th(class = "num", "Percentil")
+      )
+    ),
+    tags$tbody(pmap(personas, function(id, nombre, puntaje, z, percentil, ...) {
+      tags$tr(
+        class = if (id == "P12") "activa" else NULL,
+        `data-persona` = id,
+        tags$td(id),
+        tags$td(nombre),
+        tags$td(class = "num", as.integer(puntaje)),
+        tags$td(class = "num", fmt_signo(z)),
+        tags$td(class = "num", percentil)
+      )
+    }))
+  ),
+  p(
+    class = "caption-tabla",
+    "Tabla 1. El percentil del grupo es el porcentaje de personas con un puntaje estrictamente menor. La fila resaltada es la persona seleccionada."
+  )
+)
+```
+
+<script>
+(function () {
+  function arrancar() {
+    var select = document.querySelector(".crosstalk-input-select select");
+    if (!select || !select.selectize || typeof crosstalk === "undefined") {
+      setTimeout(arrancar, 40);
+      return;
+    }
+
+    var handle = new crosstalk.FilterHandle("prueba");
+
+    function aplicar(keys) {
+      var id = keys && keys.length === 1 ? keys[0] : null;
+      document.querySelectorAll(".ficha[data-persona]").forEach(function (el) {
+        el.hidden = el.getAttribute("data-persona") !== id;
+      });
+      document.querySelectorAll("tr[data-persona]").forEach(function (el) {
+        el.classList.toggle("activa", el.getAttribute("data-persona") === id);
+      });
+    }
+
+    handle.on("change", function (evento) {
+      aplicar(evento.value);
+    });
+
+    select.selectize.removeOption("");
+    select.selectize.setValue("P12 · Nicolás Torres");
+  }
+
+  if (document.readyState === "complete") arrancar();
+  else window.addEventListener("load", arrancar);
+})();
+</script>
+
+<p class="nota">Documento de demostración. Los 20 puntajes son simulados y la curva es la distribución normal ajustada a la media y la desviación estándar de esta muestra. El percentil de la curva puede diferir del percentil del grupo porque el primero compara el puntaje con ese modelo y el segundo lo compara con las otras personas. El selector funciona dentro de esta página.</p>
+
+:::
